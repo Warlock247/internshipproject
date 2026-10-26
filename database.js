@@ -180,6 +180,18 @@ async function signInLecturer(password) {
   return { success: true, account: profile };
 }
 
+function normalizeProfile(row) {
+  if (!row) return null;
+  const fullName = (row.full_name || `${row.surname || ''} ${row.first_name || ''}`.trim()) || 'Student';
+  return {
+    ...row,
+    fullName,
+    full_name: fullName,
+    firstName: row.first_name || '',
+    first_name: row.first_name || '',
+  };
+}
+
 async function getProfile(userId) {
   const { data, error } = await portalDb
     .from('profiles')
@@ -187,7 +199,7 @@ async function getProfile(userId) {
     .eq('id', userId)
     .maybeSingle();
   if (error) throw new Error(getBackendError(error));
-  return data;
+  return normalizeProfile(data);
 }
 
 function getAccount(matric) {
@@ -223,7 +235,7 @@ async function loadPortalData(profile) {
     if (result.error) throw new Error(getBackendError(result.error));
   }
 
-  profiles = profileResult.data || [];
+  profiles = (profileResult.data || []).map(normalizeProfile);
   submissions = await Promise.all((applicationResult.data || []).map(hydrateSubmission));
   logEntries = await Promise.all((logResult.data || []).map(hydrateLogEntry));
 }

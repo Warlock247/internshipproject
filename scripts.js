@@ -422,7 +422,8 @@ function launchStudentDashboard(account) {
   // Header display: Name and 9-digit Matric Number at the top
   studentHeaderBadge.classList.remove('hidden');
   lecturerHeaderBadge.classList.add('hidden');
-  document.getElementById('loggedInStudentName').textContent = account.fullName;
+  const studentDisplayName = account.fullName || account.full_name || `${account.surname || ""} ${account.first_name || ""}`.trim() || "Student";
+  document.getElementById('loggedInStudentName').textContent = studentDisplayName;
   document.getElementById('loggedInMatric').textContent = account.matric;
 
   // Sidebar menus
@@ -555,7 +556,10 @@ function setupStudentApplicationForm() {
   if (!currentStudent) return;
   const sub = getSubmissionByMatric(currentStudent.matric);
 
-  document.getElementById('fullName').value = sub ? sub.fullName : currentStudent.fullName;
+  const fallbackName = currentStudent.fullName || currentStudent.full_name || `${currentStudent.surname || ""} ${currentStudent.first_name || ""}`.trim() || "";
+  const studentName = (sub && sub.fullName && sub.fullName !== 'undefined') ? sub.fullName : fallbackName;
+
+  document.getElementById('fullName').value = studentName;
   document.getElementById('matricNumber').value = currentStudent.matric;
 
   if (sub) {
@@ -770,7 +774,7 @@ logbookForm.addEventListener('submit', async event => {
     );
     await saveLogEntry({
       matric: currentStudent.matric,
-      studentName: currentStudent.fullName,
+      studentName: currentStudent.fullName || currentStudent.full_name || `${currentStudent.surname || ""} ${currentStudent.first_name || ""}`.trim(),
       week,
       dates,
       tasks,
