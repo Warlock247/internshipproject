@@ -25,6 +25,7 @@
       </div>
 
       <div class="login-panel" id="authPanel">
+        <div id="backendMessage" class="auth-error hidden"></div>
         <div class="login-buttons">
           <button type="button" id="studentLoginButton" class="login-switch active">Student Login</button>
           <button type="button" id="studentSignupButton" class="login-switch">Student Sign Up</button>
@@ -41,7 +42,7 @@
           <div class="field-group">
             <label for="studentPassword">Password</label>
             <input type="password" id="studentPassword" name="studentPassword" placeholder="Enter your password" required />
-            <small class="file-help">Enter the password you used when creating your account.</small>
+            <small class="file-help">Enter your surname exactly as you entered it during sign up.</small>
           </div>
           <div class="login-actions">
             <button type="submit" class="primary-btn">Login to Dashboard</button>
@@ -56,7 +57,7 @@
           <div class="field-group">
             <label for="signupSurname">Surname (Last Name)</label>
             <input type="text" id="signupSurname" name="signupSurname" placeholder="e.g. Olaoye" required />
-            <small class="file-help">Use a password you can remember.</small>
+            <small class="file-help">Your surname will be used as your student password.</small>
           </div>
           <div class="field-group">
             <label for="signupFirstName">First Name</label>
@@ -104,7 +105,7 @@
         <form id="lecturerLoginForm" class="role-login hidden">
           <div class="field-group">
             <label for="lecturerPassword">Lecturer Passcode</label>
-            <input type="password" id="lecturerPassword" name="lecturerPassword" placeholder="Enter lecturer passcode" required />
+            <input type="password" id="lecturerPassword" name="lecturerPassword" placeholder="Enter lecturer passcode" autocomplete="current-password" required />
           </div>
           <div class="login-actions">
             <button type="submit" class="primary-btn">Lecturer Login</button>
@@ -527,6 +528,8 @@
     </div>
   </div>
 
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="supabase-config.js"></script>
   <script src="database.js"></script>
   <script src="scripts.js"></script>
 </body>

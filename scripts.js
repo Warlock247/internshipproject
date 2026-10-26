@@ -11,49 +11,26 @@
 const EMAILJS_SERVICE_ID = 'service_s4rqujp';
 const EMAILJS_TEMPLATE_ID = 'template_mas8t7o';
 const EMAILJS_PUBLIC_KEY = 'sNi2AVf3oBInwdYEe';
-const LECTURER_PASSCODE = 'lecturer2026';
-const AUTH_SESSION_KEY = 'internship_active_session';
 
 let currentStudent = null; // Currently logged-in student account
 let currentRole = null;    // 'student' or 'lecturer'
 let otpCountdownTimer = null;
 
-function saveAuthSession() {
-  if (!currentStudent && !currentRole) {
-    localStorage.removeItem(AUTH_SESSION_KEY);
-    return;
-  }
-
-  localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify({
-    currentStudent,
-    currentRole,
-  }));
+function showBackendMessage(message) {
+  const element = document.getElementById('backendMessage');
+  if (!element) return;
+  element.textContent = message || '';
+  element.classList.toggle('hidden', !message);
 }
 
-function restoreAuthSession() {
-  try {
-    const stored = JSON.parse(localStorage.getItem(AUTH_SESSION_KEY) || 'null');
-    if (!stored) return false;
-
-    if (stored.currentRole === 'student' && stored.currentStudent) {
-      currentStudent = stored.currentStudent;
-      currentRole = 'student';
-      launchStudentDashboard(currentStudent);
-      return true;
-    }
-
-    if (stored.currentRole === 'lecturer') {
-      currentStudent = null;
-      currentRole = 'lecturer';
-      launchLecturerDashboard();
-      return true;
-    }
-  } catch (error) {
-    console.warn('Failed to restore session:', error);
-    localStorage.removeItem(AUTH_SESSION_KEY);
-  }
-
-  return false;
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, character => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  })[character]);
 }
 
 // Send email using EmailJS (template variables: {{to_email}} and {{otp_code}})
@@ -73,15 +50,15 @@ async function sendOtpEmail(toEmail, otpCode, studentName) {
   );
 }
 
-// Convert uploaded file to Base64 data URL
-function fileToDataUrl(file) {
-  return new Promise(resolve => {
-    if (!file) return resolve(null);
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => resolve(null);
-    reader.readAsDataURL(file);
-  });
+function getOtpSendErrorMessage(error) {
+  const message = String(error?.text || error?.message || '');
+  if (/API access from non-browser environments/i.test(message)) {
+    return 'EmailJS rejected this page origin. Do not open the HTML file directly. Use the published HTTPS website or a local HTTP server, and allow that exact website origin in EmailJS Account → Security.';
+  }
+  if (error?.status === 403) {
+    return 'EmailJS denied this request (403). In EmailJS Account → Security, allow https://warlock247.github.io. Also confirm your EmailJS service and template are enabled.';
+  }
+  return `Could not send email: ${message || 'Check your EmailJS service, template, and connection.'}`;
 }
 
 function setAuthError(elementId, message) {
@@ -172,6 +149,7 @@ document.getElementById('forgotPasswordButton').addEventListener('click', () => 
 // Step 1: Sign up details -> Send OTP
 studentSignupForm.addEventListener('submit', async event => {
   event.preventDefault();
+  showBackendMessage('');
   setAuthError('signupError', null);
 
   const surname = document.getElementById('signupSurname').value.trim();
@@ -182,9 +160,8 @@ studentSignupForm.addEventListener('submit', async event => {
   if (!isValidMatric(matric)) {
     return setAuthError('signupError', 'Matric number must be exactly 9 digits.');
   }
-
-  if (getAccount(matric)) {
-    return setAuthError('signupError', 'An account with this matric already exists. Please log in.');
+  if (surname.length < 6) {
+    return setAuthError('signupError', 'Supabase requires passwords of at least 6 characters. This portal uses your surname as the password, so the surname must be at least 6 characters.');
   }
 
   const submitBtn = studentSignupForm.querySelector('button[type="submit"]');
@@ -197,14 +174,15 @@ studentSignupForm.addEventListener('submit', async event => {
     const otpData = createOTP(surname, firstName, matric, email);
     await sendOtpEmail(email, otpData.code, `${surname} ${firstName}`);
 
-    document.getElementById('otpInfoMessage').innerHTML =
-      `A 6-digit verification code has been sent to <strong>${email}</strong>. Check inbox & spam folder.`;
+    document.getElementById('otpInfoMessage').textContent =
+      `A 6-digit verification code has been sent to ${email}. Check inbox & spam folder.`;
 
     startOtpCountdown(120);
     switchAuthTab('otp');
   } catch (err) {
     console.error('OTP error:', err);
-    setAuthError('signupError', `Could not send email: ${err?.text || err?.message || 'Check connection.'}`);
+    clearPendingOTP();
+    setAuthError('signupError', getOtpSendErrorMessage(err));
   } finally {
     submitBtn.disabled = false;
     submitBtn.textContent = originalText;
@@ -234,7 +212,7 @@ function startOtpCountdown(seconds) {
 }
 
 // Step 2: Verify OTP
-otpVerifyForm.addEventListener('submit', event => {
+otpVerifyForm.addEventListener('submit', async event => {
   event.preventDefault();
   setAuthError('otpError', null);
 
@@ -245,13 +223,26 @@ otpVerifyForm.addEventListener('submit', event => {
     return setAuthError('otpError', result.message);
   }
 
-  if (otpCountdownTimer) clearInterval(otpCountdownTimer);
-  launchStudentDashboard(result.account);
+  const submitBtn = otpVerifyForm.querySelector('button[type="submit"]');
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Creating account...';
+  try {
+    const account = await createStudentAccount(result.pending);
+    clearPendingOTP();
+    if (otpCountdownTimer) clearInterval(otpCountdownTimer);
+    await loadPortalData(account.profile);
+    launchStudentDashboard(account.profile);
+  } catch (error) {
+    setAuthError('otpError', error.message || 'Could not create your online account.');
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Verify & Create Account';
+  }
 });
 
 // Resend OTP
 document.getElementById('resendOtpButton').addEventListener('click', async () => {
-  const pending = dbGet(DB_KEYS.OTP, null);
+  const pending = getPendingOTP();
   if (!pending) return switchAuthTab('signup');
 
   const resendBtn = document.getElementById('resendOtpButton');
@@ -264,14 +255,18 @@ document.getElementById('resendOtpButton').addEventListener('click', async () =>
     startOtpCountdown(120);
     alert(`New code sent to ${pending.email}.`);
   } catch (err) {
-    setAuthError('otpError', 'Failed to resend code.');
+    console.error('OTP resend error:', err);
+    clearPendingOTP();
+    setAuthError('otpError', getOtpSendErrorMessage(err));
     resendBtn.disabled = false;
+    resendBtn.textContent = 'Resend OTP';
   }
 });
 
 // Student Login
-studentLoginForm.addEventListener('submit', event => {
+studentLoginForm.addEventListener('submit', async event => {
   event.preventDefault();
+  showBackendMessage('');
   const matric = document.getElementById('studentMatric').value.trim();
   const password = document.getElementById('studentPassword').value.trim();
 
@@ -279,33 +274,66 @@ studentLoginForm.addEventListener('submit', event => {
     return alert('Matric number must be exactly 9 digits.');
   }
 
-  const result = verifyLogin(matric, password);
-  if (!result.success) {
-    return alert(result.message);
+  const submitBtn = studentLoginForm.querySelector('button[type="submit"]');
+  submitBtn.disabled = true;
+  try {
+    const result = await signInStudent(matric, password);
+    if (!result.success) {
+      return alert(result.message);
+    }
+    await loadPortalData(result.account);
+    document.getElementById('studentPassword').value = '';
+    launchStudentDashboard(result.account);
+  } catch (error) {
+    showBackendMessage(error.message);
+    try {
+      await signOutOnline();
+    } catch (signOutError) {
+      console.error('Could not clear the failed online session:', signOutError);
+    }
+  } finally {
+    submitBtn.disabled = false;
   }
-
-  document.getElementById('studentPassword').value = '';
-  launchStudentDashboard(result.account);
 });
 
 // Lecturer Login
-lecturerLoginForm.addEventListener('submit', event => {
+lecturerLoginForm.addEventListener('submit', async event => {
   event.preventDefault();
+  showBackendMessage('');
   const pass = document.getElementById('lecturerPassword').value.trim();
 
-  if (pass === LECTURER_PASSCODE) {
+  const submitBtn = lecturerLoginForm.querySelector('button[type="submit"]');
+  submitBtn.disabled = true;
+  try {
+    const result = await signInLecturer(pass);
+    if (!result.success) {
+      return alert(result.message);
+    }
+    await loadPortalData(result.account);
     document.getElementById('lecturerPassword').value = '';
     launchLecturerDashboard();
-  } else {
-    alert('Incorrect lecturer passcode.');
+  } catch (error) {
+    showBackendMessage(error.message);
+    try {
+      await signOutOnline();
+    } catch (signOutError) {
+      console.error('Could not clear the failed online session:', signOutError);
+    }
+  } finally {
+    submitBtn.disabled = false;
   }
 });
 
 // Logout
-function logout() {
+async function logout() {
+  try {
+    await signOutOnline();
+  } catch (error) {
+    showBackendMessage(error.message);
+    return;
+  }
   currentStudent = null;
   currentRole = null;
-  localStorage.removeItem(AUTH_SESSION_KEY);
 
   authWrapper.classList.remove('hidden');
   dashboardShell.classList.add('hidden');
@@ -314,7 +342,7 @@ function logout() {
   switchAuthTab('login');
 }
 
-document.getElementById('logoutBtn').addEventListener('click', logout);
+document.getElementById('logoutBtn').addEventListener('click', () => logout());
 
 // ===================================================================
 // 4. DASHBOARD SHELL & SIDEBAR NAVIGATION
@@ -386,7 +414,6 @@ document.querySelectorAll('.sidebar-nav-btn').forEach(btn => {
 function launchStudentDashboard(account) {
   currentStudent = account;
   currentRole = 'student';
-  saveAuthSession();
 
   // Toggle wrappers
   authWrapper.classList.add('hidden');
@@ -410,7 +437,6 @@ function launchStudentDashboard(account) {
 function launchLecturerDashboard() {
   currentStudent = null;
   currentRole = 'lecturer';
-  saveAuthSession();
 
   authWrapper.classList.add('hidden');
   dashboardShell.classList.remove('hidden');
@@ -492,14 +518,14 @@ function renderStudentApplicationStatus() {
 
   // Documents
   document.getElementById('recordAcceptanceForm').innerHTML = sub.acceptanceFileData
-    ? `<a href="${sub.acceptanceFileData}" download="${sub.acceptanceForm}" class="file-link">📥 Download</a>
-       <button type="button" class="preview-btn" onclick="openPreview('${sub.acceptanceForm}', '${sub.acceptanceFileData}')">👁️ Preview</button>`
-    : sub.acceptanceForm || 'None';
+    ? `<a href="${escapeHtml(sub.acceptanceFileData)}" download="${escapeHtml(sub.acceptanceForm)}" class="file-link">📥 Download</a>
+       <button type="button" class="preview-btn" data-preview-name="${escapeHtml(sub.acceptanceForm)}" data-preview-url="${escapeHtml(sub.acceptanceFileData)}">👁️ Preview</button>`
+    : escapeHtml(sub.acceptanceForm || 'None');
 
   document.getElementById('recordApplicationLetter').innerHTML = sub.applicationLetterData
-    ? `<a href="${sub.applicationLetterData}" download="${sub.applicationLetter}" class="file-link">📥 Download</a>
-       <button type="button" class="preview-btn" onclick="openPreview('${sub.applicationLetter}', '${sub.applicationLetterData}')">👁️ Preview</button>`
-    : sub.applicationLetter || 'None';
+    ? `<a href="${escapeHtml(sub.applicationLetterData)}" download="${escapeHtml(sub.applicationLetter)}" class="file-link">📥 Download</a>
+       <button type="button" class="preview-btn" data-preview-name="${escapeHtml(sub.applicationLetter)}" data-preview-url="${escapeHtml(sub.applicationLetterData)}">👁️ Preview</button>`
+    : escapeHtml(sub.applicationLetter || 'None');
 
   document.getElementById('recordNotes').textContent = sub.notes || 'None';
 
@@ -584,43 +610,51 @@ submissionForm.addEventListener('submit', async event => {
   const acceptFile = document.getElementById('acceptanceForm').files[0];
   const letterFile = document.getElementById('applicationLetter').files[0];
 
-  let acceptanceForm = existing ? existing.acceptanceForm : 'No file';
-  let acceptanceFileData = existing ? existing.acceptanceFileData : null;
-  if (acceptFile) {
-    acceptanceForm = acceptFile.name;
-    acceptanceFileData = await fileToDataUrl(acceptFile);
+  try {
+    let acceptanceForm = existing ? existing.acceptanceForm : 'No file';
+    let acceptanceFileData = existing ? existing.acceptanceFileData : null;
+    let acceptanceFilePath = existing ? existing.acceptanceFilePath : null;
+    if (acceptFile) {
+      acceptanceForm = acceptFile.name;
+      acceptanceFilePath = await uploadPortalFile(acceptFile, matricNumber, 'acceptance-form');
+      acceptanceFileData = await createSignedAssetUrl(acceptanceFilePath);
+    }
+
+    let applicationLetter = existing ? existing.applicationLetter : 'No file';
+    let applicationLetterData = existing ? existing.applicationLetterData : null;
+    let applicationLetterPath = existing ? existing.applicationLetterPath : null;
+    if (letterFile) {
+      applicationLetter = letterFile.name;
+      applicationLetterPath = await uploadPortalFile(letterFile, matricNumber, 'application-letter');
+      applicationLetterData = await createSignedAssetUrl(applicationLetterPath);
+    }
+
+    await saveSubmission({
+      fullName,
+      matricNumber,
+      department,
+      school,
+      supervisor,
+      companyName,
+      companyPhone,
+      startDate,
+      endDate,
+      acceptanceForm,
+      acceptanceFileData,
+      acceptanceFilePath,
+      applicationLetter,
+      applicationLetterData,
+      applicationLetterPath,
+      notes,
+    });
+    alert('Application saved successfully to your online account.');
+    switchDashboardView('status');
+  } catch (error) {
+    alert(`Could not save your application online: ${error.message}`);
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Submit Application';
   }
-
-  let applicationLetter = existing ? existing.applicationLetter : 'No file';
-  let applicationLetterData = existing ? existing.applicationLetterData : null;
-  if (letterFile) {
-    applicationLetter = letterFile.name;
-    applicationLetterData = await fileToDataUrl(letterFile);
-  }
-
-  saveSubmission({
-    fullName,
-    matricNumber,
-    department,
-    school,
-    supervisor,
-    companyName,
-    companyPhone,
-    startDate,
-    endDate,
-    acceptanceForm,
-    acceptanceFileData,
-    applicationLetter,
-    applicationLetterData,
-    notes,
-  });
-
-  submitBtn.disabled = false;
-  submitBtn.textContent = 'Submit Application';
-  alert('Application saved successfully!');
-
-  // Return to application status view
-  switchDashboardView('status');
 });
 
 // ===================================================================
@@ -686,7 +720,7 @@ function setupLogbookWeeks(sub) {
   }
 
   if (logWeekHelp && sub && sub.startDate && sub.endDate) {
-    logWeekHelp.innerHTML = `Project duration: <strong>${totalWeeks} weeks</strong> (${sub.startDate} to ${sub.endDate}).`;
+    logWeekHelp.textContent = `Project duration: ${totalWeeks} weeks (${sub.startDate} to ${sub.endDate}).`;
   }
 }
 
@@ -728,23 +762,32 @@ logbookForm.addEventListener('submit', async event => {
   const tasks = document.getElementById('logTasks').value.trim();
   const skills = document.getElementById('logSkills').value.trim();
   const selectedFiles = Array.from(document.getElementById('logImages').files || []);
-  const uploadedImages = await Promise.all(selectedFiles.map(file => fileToDataUrl(file)));
+  const submitBtn = logbookForm.querySelector('button[type="submit"]');
+  submitBtn.disabled = true;
+  try {
+    const uploadedImages = await Promise.all(
+      selectedFiles.map(file => uploadPortalFile(file, currentStudent.matric, 'logbook'))
+    );
+    await saveLogEntry({
+      matric: currentStudent.matric,
+      studentName: currentStudent.fullName,
+      week,
+      dates,
+      tasks,
+      skills,
+      images: uploadedImages.filter(Boolean),
+      approved: false,
+    });
 
-  saveLogEntry({
-    matric: currentStudent.matric,
-    studentName: currentStudent.fullName,
-    week,
-    dates,
-    tasks,
-    skills,
-    images: uploadedImages.filter(Boolean),
-    approved: false,
-  });
-
-  logbookForm.reset();
-  renderLogbookList();
-  renderStudentLogbookView();
-  alert('Weekly log entry saved successfully!');
+    logbookForm.reset();
+    renderLogbookList();
+    renderStudentLogbookView();
+    alert('Weekly log entry saved successfully online.');
+  } catch (error) {
+    alert(`Could not save your logbook entry online: ${error.message}`);
+  } finally {
+    submitBtn.disabled = false;
+  }
 });
 
 function renderLogbookList() {
@@ -758,12 +801,12 @@ function renderLogbookList() {
 
   logbookList.innerHTML = logs.map(l => `
     <div class="logbook-entry">
-      <span class="log-week-badge">${l.week}</span>
-      <small style="color: var(--text-muted); float: right;">Period: ${l.dates}</small>
-      <div style="margin: 8px 0;"><strong>Activities:</strong> ${l.tasks}</div>
-      <div style="font-size: 0.85rem; color: var(--text-muted);"><strong>Skills Learned:</strong> ${l.skills}</div>
+    <span class="log-week-badge">${escapeHtml(l.week)}</span>
+    <small style="color: var(--text-muted); float: right;">Period: ${escapeHtml(l.dates)}</small>
+    <div style="margin: 8px 0;"><strong>Activities:</strong> ${escapeHtml(l.tasks)}</div>
+    <div style="font-size: 0.85rem; color: var(--text-muted);"><strong>Skills Learned:</strong> ${escapeHtml(l.skills)}</div>
       <div style="margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px;">
-        ${(Array.isArray(l.images) && l.images.length ? l.images.map(image => `<img src="${image}" alt="${l.week} proof" style="max-width: 120px; max-height: 90px; border-radius: 10px; border: 1px solid #dfe9f2; object-fit: cover;" />`).join('') : '<span style="color: var(--text-muted);">No images uploaded for this week.</span>')}
+      ${(Array.isArray(l.images) && l.images.length ? l.images.map(image => `<img src="${escapeHtml(image)}" alt="${escapeHtml(l.week)} proof" style="max-width: 120px; max-height: 90px; border-radius: 10px; border: 1px solid #dfe9f2; object-fit: cover;" />`).join('') : '<span style="color: var(--text-muted);">No images uploaded for this week.</span>')}
       </div>
       <div style="margin-top: 8px; font-size: 0.8rem; color: var(--text-muted);">
         ${l.approved ? '✅ Lecturer approved this weekly log.' : '⏳ Pending lecturer approval.'}
@@ -812,11 +855,19 @@ const closePreviewBtn = document.getElementById('closePreviewBtn');
 function openPreview(filename, dataUrl) {
   if (!dataUrl) return alert('No file data available.');
   previewTitle.textContent = filename || 'Document Preview';
-
+  previewBody.replaceChildren();
   if (dataUrl.startsWith('data:image/')) {
-    previewBody.innerHTML = `<img src="${dataUrl}" alt="Preview" style="max-width:100%; border-radius:8px;" />`;
+    const image = document.createElement('img');
+    image.src = dataUrl;
+    image.alt = 'Preview';
+    image.style.cssText = 'max-width:100%; border-radius:8px;';
+    previewBody.appendChild(image);
   } else {
-    previewBody.innerHTML = `<iframe src="${dataUrl}" style="width:100%; height:480px; border:none; border-radius:8px;"></iframe>`;
+    const frame = document.createElement('iframe');
+    frame.src = dataUrl;
+    frame.title = filename || 'Document Preview';
+    frame.style.cssText = 'width:100%; height:480px; border:none; border-radius:8px;';
+    previewBody.appendChild(frame);
   }
   previewModal.classList.remove('hidden');
 }
@@ -888,14 +939,14 @@ function renderLecturerDashboard() {
     const row = document.createElement('tr');
 
     const acceptDoc = entry.acceptanceFileData
-      ? `<a href="${entry.acceptanceFileData}" download="${entry.acceptanceForm}" class="file-link">📥 Form</a>
-         <button type="button" class="preview-btn" onclick="openPreview('${entry.acceptanceForm}', '${entry.acceptanceFileData}')">👁️</button>`
-      : entry.acceptanceForm || 'None';
+      ? `<a href="${escapeHtml(entry.acceptanceFileData)}" download="${escapeHtml(entry.acceptanceForm)}" class="file-link">📥 Form</a>
+         <button type="button" class="preview-btn" data-preview-name="${escapeHtml(entry.acceptanceForm)}" data-preview-url="${escapeHtml(entry.acceptanceFileData)}">👁️</button>`
+      : escapeHtml(entry.acceptanceForm || 'None');
 
     const letterDoc = entry.applicationLetterData
-      ? `<a href="${entry.applicationLetterData}" download="${entry.applicationLetter}" class="file-link">📥 Letter</a>
-         <button type="button" class="preview-btn" onclick="openPreview('${entry.applicationLetter}', '${entry.applicationLetterData}')">👁️</button>`
-      : entry.applicationLetter || 'None';
+      ? `<a href="${escapeHtml(entry.applicationLetterData)}" download="${escapeHtml(entry.applicationLetter)}" class="file-link">📥 Letter</a>
+         <button type="button" class="preview-btn" data-preview-name="${escapeHtml(entry.applicationLetter)}" data-preview-url="${escapeHtml(entry.applicationLetterData)}">👁️</button>`
+      : escapeHtml(entry.applicationLetter || 'None');
 
     const logEntries = getLogEntries(entry.matricNumber);
     const logsPendingApproval = logEntries.length > 0 && !entry.logbookApproved;
@@ -905,19 +956,19 @@ function renderLecturerDashboard() {
     let actionsHtml = '';
     if (status === 'Accepted') {
       actionsHtml = `
-        <button type="button" class="action-button edit-btn" onclick="overturnDecision(${entry.id})">✏️ Overturn</button>
-        <button type="button" class="action-button logs-btn" onclick="openStudentLogsModal('${entry.matricNumber}', '${entry.fullName}')">📖 Logs</button>
+        <button type="button" class="action-button edit-btn" data-review-action="overturn" data-submission-id="${escapeHtml(entry.id)}">✏️ Overturn</button>
+        <button type="button" class="action-button logs-btn" data-review-action="logs" data-matric="${escapeHtml(entry.matricNumber)}" data-student-name="${escapeHtml(entry.fullName)}">📖 Logs</button>
       `;
       if (logEntries.length) {
         actionsHtml += `
-          <button type="button" class="action-button accept-btn" onclick="approveStudentLogbookHandler('${entry.matricNumber}', '${entry.fullName}')">${logsApproved ? '✓ Approved' : '✅ Approve Logs'}</button>
+          <button type="button" class="action-button accept-btn" data-review-action="approve-logs" data-matric="${escapeHtml(entry.matricNumber)}" data-student-name="${escapeHtml(entry.fullName)}">${logsApproved ? '✓ Approved' : '✅ Approve Logs'}</button>
         `;
       }
     } else {
       actionsHtml = `
-        <button type="button" class="action-button accept-btn" onclick="handleLecturerStatus(${entry.id}, 'Accepted')">✓ Accept</button>
-        <button type="button" class="action-button deny-btn" onclick="handleLecturerStatus(${entry.id}, 'Denied')">✕ Deny</button>
-        <button type="button" class="action-button logs-btn" onclick="openStudentLogsModal('${entry.matricNumber}', '${entry.fullName}')">📖 Logs</button>
+        <button type="button" class="action-button accept-btn" data-review-action="accept" data-submission-id="${escapeHtml(entry.id)}">✓ Accept</button>
+        <button type="button" class="action-button deny-btn" data-review-action="deny" data-submission-id="${escapeHtml(entry.id)}">✕ Deny</button>
+        <button type="button" class="action-button logs-btn" data-review-action="logs" data-matric="${escapeHtml(entry.matricNumber)}" data-student-name="${escapeHtml(entry.fullName)}">📖 Logs</button>
       `;
     }
 
@@ -927,19 +978,19 @@ function renderLecturerDashboard() {
 
     row.innerHTML = `
       <td><strong>${idx + 1}</strong></td>
-      <td><strong>${entry.fullName}</strong></td>
-      <td><code>${entry.matricNumber}</code></td>
-      <td>${entry.department}</td>
-      <td>${entry.companyName}<small>📞 ${entry.companyPhone}</small></td>
-      <td>${entry.supervisor}</td>
-      <td><small>${entry.startDate}<br>to ${entry.endDate}</small></td>
+      <td><strong>${escapeHtml(entry.fullName)}</strong></td>
+      <td><code>${escapeHtml(entry.matricNumber)}</code></td>
+      <td>${escapeHtml(entry.department)}</td>
+      <td>${escapeHtml(entry.companyName)}<small>📞 ${escapeHtml(entry.companyPhone)}</small></td>
+      <td>${escapeHtml(entry.supervisor)}</td>
+      <td><small>${escapeHtml(entry.startDate)}<br>to ${escapeHtml(entry.endDate)}</small></td>
       <td>
         <strong>${progress}%</strong>
         <div class="progress-container" style="height:6px; margin-top:4px;">
           <div class="progress-fill" style="width:${progress}%;"></div>
         </div>
       </td>
-      <td><span class="status-badge status-${status.toLowerCase()}">${status}</span></td>
+      <td><span class="status-badge status-${escapeHtml(status.toLowerCase())}">${escapeHtml(status)}</span></td>
       <td>
         <div class="action-buttons">
           ${actionsHtml}
@@ -947,8 +998,8 @@ function renderLecturerDashboard() {
       </td>
       <td>${acceptDoc}<br>${letterDoc}</td>
       <td>
-        <small>${entry.notes || 'No notes'}</small>
-        ${entry.lecturerFeedback ? `<div style="color:#dc2626; font-size:0.8rem; margin-top:4px;"><strong>Note:</strong> ${entry.lecturerFeedback}</div>` : ''}
+        <small>${escapeHtml(entry.notes || 'No notes')}</small>
+        ${entry.lecturerFeedback ? `<div style="color:#dc2626; font-size:0.8rem; margin-top:4px;"><strong>Note:</strong> ${escapeHtml(entry.lecturerFeedback)}</div>` : ''}
       </td>
     `;
     dbTableBody.appendChild(row);
@@ -984,8 +1035,12 @@ window.overturnDecision = async function(id) {
     feedback = 'Decision overturned to Pending review by lecturer.';
   }
 
-  updateSubmissionStatus(id, newStatus, feedback);
-  renderLecturerDashboard();
+  try {
+    await updateSubmissionStatus(id, newStatus, feedback);
+    renderLecturerDashboard();
+  } catch (error) {
+    return alert(`Could not update the application online: ${error.message}`);
+  }
 
   // Notify student via EmailJS
   const acc = getAccount(sub.matricNumber);
@@ -1010,8 +1065,12 @@ window.handleLecturerStatus = async function(id, newStatus) {
     if (!confirm('Mark this internship placement as Accepted?')) return;
   }
 
-  updateSubmissionStatus(id, newStatus, feedback);
-  renderLecturerDashboard();
+  try {
+    await updateSubmissionStatus(id, newStatus, feedback);
+    renderLecturerDashboard();
+  } catch (error) {
+    return alert(`Could not update the application online: ${error.message}`);
+  }
 
   const sub = getAllSubmissions().find(s => String(s.id) === String(id));
   if (sub) {
@@ -1046,9 +1105,8 @@ filterPills.forEach(pill => {
 if (exportCsvBtn) exportCsvBtn.addEventListener('click', exportSubmissionsCsv);
 if (sideExportBtn) sideExportBtn.addEventListener('click', exportSubmissionsCsv);
 
-window.approveAllLogbooks = function() {
-  const allLogs = dbGet(DB_KEYS.LOGBOOK);
-  const pending = allLogs.filter(item => !item.approved);
+window.approveAllLogbooks = async function() {
+  const pending = getAllLogEntries().filter(item => !item.approved);
 
   if (!pending.length) {
     return alert('There are no pending weekly logbooks to approve.');
@@ -1057,17 +1115,16 @@ window.approveAllLogbooks = function() {
   const confirmApprove = confirm(`Approve all ${pending.length} pending weekly logbook entries?`);
   if (!confirmApprove) return;
 
-  const updatedLogs = allLogs.map(item => ({ ...item, approved: true }));
-  dbSet(DB_KEYS.LOGBOOK, updatedLogs);
-
-  const approvedMatricNumbers = [...new Set(pending.map(item => item.matric))];
-  approvedMatricNumbers.forEach(matric => markLogbookApproved(matric, 'Approved by lecturer'));
-
-  renderLecturerDashboard();
-  if (currentStudent) {
-    renderStudentLogbookView();
+  try {
+    await approveAllPendingLogbooks();
+    renderLecturerDashboard();
+    if (currentStudent) {
+      renderStudentLogbookView();
+    }
+    alert(`Approved all ${pending.length} pending logbook entries.`);
+  } catch (error) {
+    alert(`Could not approve logbooks online: ${error.message}`);
   }
-  alert(`Approved all ${pending.length} pending logbook entries.`);
 };
 
 // Lecturer View Student Logbook Modal
@@ -1085,12 +1142,12 @@ window.openStudentLogsModal = function(matric, name) {
   } else {
     logsModalBody.innerHTML = logs.map(l => `
       <div class="logbook-entry">
-        <span class="log-week-badge">${l.week}</span>
-        <small style="color: var(--text-muted); float: right;">${l.dates}</small>
-        <div style="margin: 8px 0;"><strong>Activities:</strong> ${l.tasks}</div>
-        <div style="font-size: 0.85rem; color: var(--text-muted);"><strong>Skills:</strong> ${l.skills}</div>
+        <span class="log-week-badge">${escapeHtml(l.week)}</span>
+        <small style="color: var(--text-muted); float: right;">${escapeHtml(l.dates)}</small>
+        <div style="margin: 8px 0;"><strong>Activities:</strong> ${escapeHtml(l.tasks)}</div>
+        <div style="font-size: 0.85rem; color: var(--text-muted);"><strong>Skills:</strong> ${escapeHtml(l.skills)}</div>
         <div style="margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px;">
-          ${(Array.isArray(l.images) && l.images.length ? l.images.map(image => `<img src="${image}" alt="${l.week} proof" style="max-width: 160px; max-height: 110px; border-radius: 10px; border: 1px solid #dfe9f2; object-fit: cover;" />`).join('') : '<span style="color: var(--text-muted);">No images uploaded.</span>')}
+          ${(Array.isArray(l.images) && l.images.length ? l.images.map(image => `<img src="${escapeHtml(image)}" alt="${escapeHtml(l.week)} proof" style="max-width: 160px; max-height: 110px; border-radius: 10px; border: 1px solid #dfe9f2; object-fit: cover;" />`).join('') : '<span style="color: var(--text-muted);">No images uploaded.</span>')}
         </div>
         <div style="margin-top: 8px; font-size: 0.8rem; color: var(--text-muted);">
           ${l.approved ? '✅ Approved by lecturer' : '⏳ Awaiting lecturer approval'}
@@ -1103,7 +1160,7 @@ window.openStudentLogsModal = function(matric, name) {
     if (shouldShowApproveButton) {
       logsModalBody.insertAdjacentHTML('beforeend', `
         <div style="margin-top: 18px; text-align: right;">
-          <button type="button" class="primary-btn-sm" onclick="approveStudentLogbookHandler('${matric}', '${name}')">✅ Approve this logbook</button>
+          <button type="button" class="primary-btn-sm" data-review-action="approve-logs" data-matric="${escapeHtml(matric)}" data-student-name="${escapeHtml(name)}">✅ Approve this logbook</button>
         </div>
       `);
     }
@@ -1112,7 +1169,7 @@ window.openStudentLogsModal = function(matric, name) {
   studentLogsModal.classList.remove('hidden');
 };
 
-window.approveStudentLogbookHandler = function(matric, name) {
+window.approveStudentLogbookHandler = async function(matric, name) {
   const logs = getLogEntries(matric);
   if (!logs.length) {
     return alert(`${name} has not uploaded any weekly log entries yet.`);
@@ -1121,20 +1178,63 @@ window.approveStudentLogbookHandler = function(matric, name) {
   const confirmApprove = confirm(`Approve the full weekly logbook for ${name}?`);
   if (!confirmApprove) return;
 
-  markLogbookApproved(matric, 'Approved by lecturer');
-  const allLogs = dbGet(DB_KEYS.LOGBOOK).map(item => item.matric === matric ? { ...item, approved: true } : item);
-  dbSet(DB_KEYS.LOGBOOK, allLogs);
-
-  renderLecturerDashboard();
-  if (currentStudent && currentStudent.matric === matric) {
-    renderStudentLogbookView();
+  try {
+    await markLogbookApproved(matric, 'Approved by lecturer');
+    renderLecturerDashboard();
+    if (currentStudent && currentStudent.matric === matric) {
+      renderStudentLogbookView();
+    }
+    studentLogsModal.classList.add('hidden');
+    alert(`Weekly logbook approved for ${name}.`);
+  } catch (error) {
+    alert(`Could not approve this logbook online: ${error.message}`);
   }
-  studentLogsModal.classList.add('hidden');
-  alert(`Weekly logbook approved for ${name}.`);
 };
 
 if (closeLogsBtn) {
   closeLogsBtn.addEventListener('click', () => studentLogsModal.classList.add('hidden'));
 }
 
-restoreAuthSession();
+document.addEventListener('click', event => {
+  const target = event.target instanceof Element ? event.target : null;
+  if (!target) return;
+
+  const previewButton = target.closest('[data-preview-url]');
+  if (previewButton) {
+    openPreview(previewButton.dataset.previewName, previewButton.dataset.previewUrl);
+    return;
+  }
+
+  const actionButton = target.closest('[data-review-action]');
+  if (!actionButton) return;
+
+  const { reviewAction, submissionId, matric, studentName } = actionButton.dataset;
+  if (reviewAction === 'overturn') {
+    window.overturnDecision(submissionId);
+  } else if (reviewAction === 'accept') {
+    window.handleLecturerStatus(submissionId, 'Accepted');
+  } else if (reviewAction === 'deny') {
+    window.handleLecturerStatus(submissionId, 'Denied');
+  } else if (reviewAction === 'logs') {
+    window.openStudentLogsModal(matric, studentName);
+  } else if (reviewAction === 'approve-logs') {
+    window.approveStudentLogbookHandler(matric, studentName);
+  }
+});
+
+async function initializePortal() {
+  try {
+    const profile = await restoreOnlineSession();
+    if (!profile) return;
+    if (profile.role === 'lecturer') {
+      launchLecturerDashboard();
+    } else {
+      launchStudentDashboard(profile);
+    }
+  } catch (error) {
+    console.error('Could not restore the Supabase session:', error);
+    showBackendMessage(`Could not connect to the online portal: ${error.message}`);
+  }
+}
+
+initializePortal();
