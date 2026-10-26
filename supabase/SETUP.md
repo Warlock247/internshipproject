@@ -1,21 +1,60 @@
-# Supabase setup
+# Supabase Setup (Clean Start)
 
-1. Open the Supabase project dashboard, go to **SQL Editor**, paste the contents of `schema.sql`, and run it. This creates the portal tables, row-level security policies, and the private `portal-files` storage bucket.
-2. In **Authentication → Providers → Email**, disable Supabase email confirmation. Student email ownership is checked using the portal's EmailJS OTP step.
-3. In EmailJS **Account → Security**, allow the published origin `https://warlock247.github.io`. Test signup using the published HTTPS site or a local HTTP server, not by opening the `.html` file directly. A `file://` page has no browser origin and EmailJS rejects it. Do not enable non-browser API access just to test a local file.
-4. In **Authentication → Users**, create or update the lecturer Auth user with email `lecturer@warlock247.github.io`, password `lecturer2026`, and mark the email as confirmed. This email is an internal Supabase Auth identifier only; it is not requested on the login form.
-5. Promote that user by running this in **SQL Editor**:
+Follow these steps **in order** to set up a fresh Supabase backend.
+
+---
+
+## Step 1: Delete all existing Auth users
+
+1. Open your Supabase project dashboard: `https://supabase.com/dashboard`
+2. Go to **Authentication** → **Users**
+3. Delete **every user** listed there (select all → delete)
+
+## Step 2: Enable Email Provider
+
+1. Go to **Authentication** → **Providers** → **Email**
+2. Make sure **"Enable Email provider"** is **ON**
+3. Turn **OFF** "Confirm email" (disable email confirmation)
+4. Click **Save**
+
+## Step 3: Run the database schema
+
+1. Go to **SQL Editor**
+2. Paste the **entire** contents of `schema.sql` and click **Run**
+3. This drops all old tables/policies and creates everything fresh
+
+## Step 4: Create the lecturer Auth user
+
+1. Go to **Authentication** → **Users** → **Add user** → **Create new user**
+2. Enter:
+   - **Email:** `lecturer@portal.siwes.internal`
+   - **Password:** `lecturer2026`
+   - Check ✅ **Auto Confirm User**
+3. Click **Create user**
+
+## Step 5: Promote the lecturer profile
+
+1. Go to **SQL Editor** and run:
 
    ```sql
    update public.profiles
    set role = 'lecturer'
-   where lower(email) = 'lecturer@warlock247.github.io';
+   where id = (
+     select id from auth.users
+     where lower(email) = 'lecturer@portal.siwes.internal'
+     limit 1
+   );
    ```
 
-6. Push the updated project files and confirm the GitHub Pages deployment finishes. New student accounts are stored online in Supabase. Old browser-local data is not imported automatically.
+## Step 6: Deploy
 
-The Supabase publishable key and internal lecturer Auth identifier in `supabase-config.js` are used by the browser. Never put a Supabase service-role key or database password in the website. The lecturer form asks only for the password; Supabase still authenticates the fixed internal account and applies lecturer-only row-level security.
+Push the updated project files to GitHub and confirm the GitHub Pages deployment finishes.
 
-Student Supabase passwords are the exact surname entered at registration (case-sensitive). Supabase requires passwords to be at least six characters, so this portal cannot register a shorter surname as the password. Surnames and the shared lecturer passcode are weak credentials; anyone who learns `lecturer2026` can access the lecturer dashboard.
+---
 
-EmailJS OTP sending requires the deployed origin to be allowed in EmailJS **Account → Security**. Ensure the EmailJS template uses `{{to_email}}`, `{{otp_code}}`, and `{{to_name}}`, and the configured service is active. The OTP check currently runs in the browser, so it is not a server-enforced identity check. For official records, validate matric numbers against a trusted roster and move verification into a trusted server function.
+## How it works
+
+- **Students** sign up with matric number, surname, first name, and email. Their password is their surname (lowercased, padded to 6 characters if short). All data is saved to Supabase PostgreSQL.
+- **Lecturer** logs in with just the passcode `lecturer2026`. No email is shown on the form — the internal email `lecturer@portal.siwes.internal` is used behind the scenes.
+- **Cross-device persistence**: Data is stored in Supabase's cloud database, so logging in on any device shows the same data.
+- **EmailJS OTP** is used to verify student emails during sign-up. Make sure your deployed origin is allowed in EmailJS Account → Security.

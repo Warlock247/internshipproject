@@ -10,10 +10,24 @@ let submissions = [];
 let logEntries = [];
 
 function getBackendError(error) {
-  if (error?.code === '23505') {
+  if (!error) return 'The online database request failed.';
+  if (error.code === '23505') {
     return 'That matric number is already registered. Please log in instead.';
   }
-  return error?.message || 'The online database request failed.';
+  const msg = error.message || '';
+  if (msg.includes('email_provider_disabled') || msg.includes('Email logins are disabled')) {
+    return 'Email provider is disabled in Supabase. In your Supabase Dashboard, go to Authentication -> Providers -> Email, and toggle "Enable Email provider" to ON.';
+  }
+  if (msg.includes('Email signups are disabled')) {
+    return 'Email signups are disabled in Supabase. In your Supabase Dashboard, go to Authentication -> Providers -> Email, and toggle "Enable Email provider" to ON.';
+  }
+  if (msg.includes('Invalid login credentials')) {
+    return 'Incorrect login credentials. Please verify your details.';
+  }
+  if (msg.includes('Password should be at least 6 characters')) {
+    return 'Password must be at least 6 characters.';
+  }
+  return msg || 'The online database request failed.';
 }
 
 function createStudentAuthEmail(matric) {
@@ -21,7 +35,9 @@ function createStudentAuthEmail(matric) {
 }
 
 function createStudentAuthPassword(password) {
-  return (password || '').trim();
+  const clean = (password || '').trim().toLowerCase();
+  // Supabase Auth requires at least 6 characters. If surname is shorter, pad predictably with '0'.
+  return clean.length >= 6 ? clean : clean.padEnd(6, '0');
 }
 
 function createOTP(surname, firstName, matric, email) {
@@ -94,7 +110,7 @@ async function createStudentAccount(pending) {
       password,
     });
     if (signIn.error) {
-      throw new Error('Account created, but Supabase did not start a session. In Supabase Auth settings, disable email confirmation because this portal verifies sign-up using its email OTP.');
+      throw new Error(getBackendError(signIn.error));
     }
     session = signIn.data.session;
   }
@@ -102,21 +118,45 @@ async function createStudentAccount(pending) {
   const profile = await getProfile(data.user.id);
   if (!profile || profile.role !== 'student') {
     await portalDb.auth.signOut();
-    throw new Error('The account was created, but its student profile is missing. Run the Supabase setup SQL and try again.');
+    throw new Error('The account was created, but its student profile is missing. Please ensure the Supabase schema.sql was run.');
   }
 
   return { session, profile };
 }
 
 async function signInStudent(matric, password) {
-  const { data, error } = await portalDb.auth.signInWithPassword({
-    email: createStudentAuthEmail(matric),
-    password: createStudentAuthPassword(password),
+  const cleanMatric = (matric || '').trim();
+  const rawPass = (password || '').trim();
+  const normalizedPass = createStudentAuthPassword(rawPass);
+
+  // Attempt sign in with normalized password (lowercased / padded)
+  let { data, error } = await portalDb.auth.signInWithPassword({
+    email: createStudentAuthEmail(cleanMatric),
+    password: normalizedPass,
   });
-  if (error) return { success: false, message: 'Matric number or password is incorrect.' };
+
+  // Fallback to exact typed casing if account was registered prior to normalization
+  if (error && rawPass !== normalizedPass) {
+    const retry = await portalDb.auth.signInWithPassword({
+      email: createStudentAuthEmail(cleanMatric),
+      password: rawPass,
+    });
+    if (!retry.error) {
+      data = retry.data;
+      error = null;
+    }
+  }
+
+  if (error) {
+    const msg = error.message || '';
+    if (msg.includes('email_provider_disabled') || msg.includes('Email logins are disabled')) {
+      return { success: false, message: getBackendError(error) };
+    }
+    return { success: false, message: 'Matric number or password is incorrect.' };
+  }
 
   const profile = await getProfile(data.user.id);
-  if (!profile || profile.role !== 'student' || profile.matric !== matric) {
+  if (!profile || profile.role !== 'student' || profile.matric !== cleanMatric) {
     await portalDb.auth.signOut();
     return { success: false, message: 'This account is not configured as a student account.' };
   }
@@ -129,12 +169,12 @@ async function signInLecturer(password) {
     email: window.PORTAL_CONFIG.lecturerAuthEmail,
     password: (password || '').trim(),
   });
-  if (error) return { success: false, message: 'Incorrect lecturer password.' };
+  if (error) return { success: false, message: 'Incorrect lecturer passcode.' };
 
   const profile = await getProfile(data.user.id);
   if (!profile || profile.role !== 'lecturer') {
     await portalDb.auth.signOut();
-    return { success: false, message: 'This account is not authorized as a lecturer. Ask the portal administrator to configure its lecturer role.' };
+    return { success: false, message: 'This account is not authorized as a lecturer.' };
   }
 
   return { success: true, account: profile };
@@ -248,17 +288,39 @@ function calculateDurationWeeks(startDate, endDate) {
 
 async function createSignedAssetUrl(path) {
   if (!path) return null;
-  const { data, error } = await portalDb.storage
-    .from('portal-files')
-    .createSignedUrl(path, 3600);
-  if (error) throw new Error(getBackendError(error));
-  return data.signedUrl;
+  try {
+    const { data, error } = await portalDb.storage
+      .from('portal-files')
+      .createSignedUrl(path, 3600);
+    if (error) {
+      console.warn('Could not create signed URL for path:', path, error.message);
+      return null;
+    }
+    return data?.signedUrl || null;
+  } catch (err) {
+    console.warn('Error creating signed URL for path:', path, err);
+    return null;
+  }
+}
+
+function generateUuid() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    try {
+      return crypto.randomUUID();
+    } catch (_) {}
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
 }
 
 async function uploadPortalFile(file, matric, category) {
   if (!file) return null;
+  if (!activeUser) throw new Error('Please log in before uploading files.');
   const safeName = file.name.replace(/[^\w.-]/g, '_');
-  const path = `${activeUser.id}/${matric}/${category}/${crypto.randomUUID()}-${safeName}`;
+  const path = `${activeUser.id}/${matric}/${category}/${generateUuid()}-${safeName}`;
   const { error } = await portalDb.storage
     .from('portal-files')
     .upload(path, file, { contentType: file.type || 'application/octet-stream' });
@@ -316,16 +378,29 @@ function serializableSubmission(record) {
 
 async function saveSubmission(record) {
   if (!activeUser) throw new Error('Please log in before saving an application.');
-  const previous = getSubmissionByMatric(record.matricNumber);
+
+  // Check memory or query Supabase directly to preserve review fields
+  let previous = getSubmissionByMatric(record.matricNumber);
+  if (!previous) {
+    const { data: existingData } = await portalDb
+      .from('applications')
+      .select('*')
+      .eq('student_id', activeUser.id)
+      .maybeSingle();
+    if (existingData) {
+      previous = await hydrateSubmission(existingData);
+    }
+  }
+
   const values = {
     student_id: activeUser.id,
     matric_number: record.matricNumber,
     payload: serializableSubmission(record),
     status: 'Pending',
     lecturer_feedback: '',
-    logbook_approved: previous ? previous.logbookApproved : false,
-    logbook_status: previous ? previous.logbookStatus : null,
-    lecturer_logbook_feedback: previous ? previous.lecturerLogbookFeedback : null,
+    logbook_approved: previous ? Boolean(previous.logbookApproved) : false,
+    logbook_status: previous ? (previous.logbookStatus || null) : null,
+    lecturer_logbook_feedback: previous ? (previous.lecturerLogbookFeedback || null) : null,
   };
   const { data, error } = await portalDb
     .from('applications')
